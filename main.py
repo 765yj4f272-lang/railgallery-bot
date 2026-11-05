@@ -2,9 +2,11 @@ import os
 import logging
 import asyncio
 import requests
+import xml.etree.ElementTree as ET
 
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
+
 from telegram import Update
 from telegram.ext import (
     Application,
@@ -14,26 +16,32 @@ from telegram.ext import (
     filters
 )
 
+# Настройки
 TOKEN = os.getenv("BOT_TOKEN")
 BASE_URL = os.getenv("RENDER_EXTERNAL_URL")
 
 logging.basicConfig(level=logging.INFO)
 
+# Создаём Telegram-бота
 bot = Application.builder().token(TOKEN).build()
 
 
+# Команда /start
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🚂 Привет! Я RailGallery Bot!\n\n"
         "Отправь номер локомотива:\n"
         "РГ ВЛ10-1855\n\n"
-        "Я попробую найти информацию в интернете."
+        "Я попробую найти его на RailGallery."
     )
 
 
+# Поиск локомотива
 async def search(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
     text = update.message.text.strip()
 
+    # Проверяем команду
     if not text.upper().startswith("РГ "):
         return
 
@@ -46,76 +54,119 @@ async def search(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     await update.message.reply_text(
-        f"🔎 Ищу информацию о {locomotive}..."
+        f"🔎 Ищу {locomotive} на RailGallery..."
     )
 
     try:
+
+        # Запрос к поисковику Bing
         response = await asyncio.to_thread(
             requests.get,
-            "https://api.mwmbl.org/api/v2/search/",
-            params={"q": f"{locomotive} RailGallery"},
-            timeout=20
+            "https://www.bing.com/search",
+            params={
+                "q": f'site:railgallery.ru/railcar "{locomotive}"',
+                "format": "rss",
+                "mkt": "ru-RU"
+            },
+            headers={
+                "User-Agent": "Mozilla/5.0"
+            },
+            timeout=25
         )
 
         response.raise_for_status()
-        data = response.json()
 
-        results = data.get("results", [])
+        # Читаем XML
+        root = ET.fromstring(response.content)
 
-        if not results:
+        items = root.findall(".//item")
+
+        if not items:
             await update.message.reply_text(
-                f"😕 Информация о {locomotive} не найдена.\n\n"
-                "Попробуй проверить правильность номера."
+                f"😕 Bing пока не нашёл {locomotive} на RailGallery.\n\n"
+                "Попробуй проверить номер."
             )
             return
 
-        # Сначала показываем результаты RailGallery
-        results.sort(
-            key=lambda item: (
-                "railgallery.ru" not in item.get("url", "")
-            )
-        )
-
         message = f"🚂 Результаты поиска: {locomotive}\n\n"
 
-        for item in results[:5]:
-            title = item.get("title", "Без названия")
-            url = item.get("url", "")
-            content = item.get("content", "")
+        count = 0
+
+        for item in items:
+
+            title = item.findtext(
+                "title",
+                "Без названия"
+            )
+
+            url = item.findtext(
+                "link",
+                ""
+            )
+
+            description = item.findtext(
+                "description",
+                ""
+            )
+
+            # Оставляем только RailGallery
+            if "railgallery.ru" not in url:
+                continue
 
             message += f"📌 {title}\n"
 
-            if content:
-                message += f"{content[:400]}\n"
+            if description:
+                message += f"{description[:500]}\n"
 
-            if url:
-                message += f"🔗 {url}\n"
+            message += f"🔗 {url}\n\n"
 
-            message += "\n"
+            count += 1
 
-        message += "ℹ️ Данные получены из поискового индекса."
+            if count >= 5:
+                break
+
+        if count == 0:
+            await update.message.reply_text(
+                f"😕 Не удалось найти карточку {locomotive} на RailGallery."
+            )
+            return
+
+        message += "ℹ️ Данные получены из поисковой выдачи Bing."
 
         await update.message.reply_text(
             message[:4000],
             disable_web_page_preview=True
         )
 
-    except requests.RequestException as e:
-        logging.error(f"Ошибка поиска: {e}")
+    except ET.ParseError:
+
+        logging.exception("Ошибка обработки XML")
 
         await update.message.reply_text(
-            "⚠️ Бесплатный поисковик сейчас недоступен."
+            "⚠️ Поисковик вернул непонятный ответ. Попробуй позже."
+        )
+
+    except requests.RequestException:
+
+        logging.exception("Ошибка запроса Bing")
+
+        await update.message.reply_text(
+            "⚠️ Bing сейчас не отвечает. Попробуй позже."
         )
 
     except Exception:
-        logging.exception("Ошибка обработки поиска")
+
+        logging.exception("Ошибка поиска")
 
         await update.message.reply_text(
             "⚠️ Произошла ошибка при поиске."
         )
 
 
-bot.add_handler(CommandHandler("start", start))
+# Подключаем команды и обработчики
+bot.add_handler(
+    CommandHandler("start", start)
+)
 
 bot.add_handler(
     MessageHandler(
@@ -125,8 +176,10 @@ bot.add_handler(
 )
 
 
+# Запуск приложения
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+
     if not TOKEN or not BASE_URL:
         raise RuntimeError(
             "Не заданы BOT_TOKEN или RENDER_EXTERNAL_URL"
@@ -147,11 +200,15 @@ async def lifespan(app: FastAPI):
     await bot.shutdown()
 
 
-app = FastAPI(lifespan=lifespan)
+app = FastAPI(
+    lifespan=lifespan
+)
 
 
+# Получение сообщений Telegram
 @app.post("/telegram")
 async def telegram_webhook(request: Request):
+
     data = await request.json()
 
     update = Update.de_json(
@@ -161,11 +218,15 @@ async def telegram_webhook(request: Request):
 
     await bot.process_update(update)
 
-    return {"ok": True}
+    return {
+        "ok": True
+    }
 
 
+# Проверка работы сервера
 @app.get("/")
 async def home():
+
     return {
         "status": "RailGallery Bot is running!"
     }
